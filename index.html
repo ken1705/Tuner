@@ -210,7 +210,7 @@ button:focus-visible{outline:2px solid var(--ok);outline-offset:2px}
   }
 
   /* ---------- readout ---------- */
-  var MIC_MSG='Mic is blocked. Allow microphone access for this page, then tap Enable mic.';
+  var MIC_MSG='Mic is blocked. Allow it for this site (Safari: aA, Website Settings, Microphone, Allow), then tap Enable mic.';
   function idleHint(){return S.mic?'Listening. Pluck one string and let it ring.':'Tap Enable mic, or tap a string to hear it.'}
   function setMeter(m,hz,cents,state,hint){
     $('note').textContent=nm(m);
@@ -249,9 +249,9 @@ button:focus-visible{outline:2px solid var(--ok);outline-offset:2px}
     $('tunings').innerHTML=h;
   }
   function renderA4(){$('a4val').textContent=S.a4}
-  function setMicUI(on){
+  function setMicUI(on,label){
     $('mic').setAttribute('aria-pressed',on?'true':'false');
-    $('micLabel').textContent=on?'Mic on':'Enable mic';
+    $('micLabel').textContent=label||(on?'Mic on':'Enable mic');
   }
 
   /* ---------- reference tone ---------- */
@@ -261,6 +261,7 @@ button:focus-visible{outline:2px solid var(--ok);outline-offset:2px}
       var AC=window.AudioContext||window.webkitAudioContext;
       if(!AC)return null;
       ctx=new AC();
+      ctx.onstatechange=function(){if(ctx.state==='running'&&S.mic){waitTap=false;lastMsg='';showIdle()}};
     }
     if(ctx.state!=='running'&&ctx.resume)ctx.resume();
     if(!wave){
@@ -361,7 +362,7 @@ button:focus-visible{outline:2px solid var(--ok);outline-offset:2px}
   }
   /* Only lock onto something that behaves like a plucked string:
      it starts suddenly out of quiet, holds one pitch for ~150 ms, and then fades. */
-  var GATE2=0.01;
+  var GATE2=0.004;
   var TRK={nf:0.0015,rec:[],lr:[],sess:false,t0:0,peak:0,lastLoud:0,buf:[],out:0,lastOk:0,bad:0,status:'quiet'};
   function trkReset(){TRK.rec=[];TRK.lr=[];TRK.sess=false;TRK.buf=[];TRK.out=0;TRK.lastOk=0;TRK.bad=0;TRK.status='quiet'}
   function trkGate(){return Math.max(GATE2,TRK.nf*3)}
@@ -375,17 +376,17 @@ button:focus-visible{outline:2px solid var(--ok);outline-offset:2px}
     var num=0,den=0;
     for(i=0;i<n;i++){num+=(L[i].t-tm)*(L[i].y-ym);den+=(L[i].t-tm)*(L[i].t-tm)}
     var sl=den?num/den:0;
-    return sl<=-0.2&&sl>=-8;
+    return sl<=-0.2&&sl>=-14;
   }
   function med(a){var c=a.slice().sort(function(p,q){return p-q});return c[c.length>>1]}
   function trkFeed(f,rms,ts,okFn){
     var T=TRK;
     if(rms<T.nf)T.nf=rms;else T.nf+=(rms-T.nf)*0.002;
-    var gate=trkGate(),loud=rms>=gate;
+    var gate=trkGate(),loud=rms>=gate,keep=T.sess?rms>=gate*0.5:loud;
     T.rec.push(rms);if(T.rec.length>8)T.rec.shift();
     T.lr.push({t:ts/1000,y:Math.log(Math.max(rms,1e-6))});if(T.lr.length>6)T.lr.shift();
     var lo=Math.min.apply(null,T.rec);
-    if(loud)T.lastLoud=ts;
+    if(keep)T.lastLoud=ts;
     if(!T.sess){
       if(loud&&T.rec.length>=4&&rms>lo*2.2){T.sess=true;T.t0=ts;T.peak=rms;T.buf=[];T.bad=0;T.out=0}
     }else{
@@ -449,8 +450,10 @@ button:focus-visible{outline:2px solid var(--ok);outline-offset:2px}
       return;
     }
     if(waitTap){waitTap=false;lastMsg='';showIdle()}
+    if(micPaused){idleMsg('Mic paused. It resumes by itself.');return}
     an.getFloatTimeDomainData(buf);
     var f=yin(buf,ctx.sampleRate);
+    if(lastRms===0){if(++deadFrames===80)heal('silent')}else deadFrames=0;
     var db=20*Math.log10(Math.max(lastRms,1e-5));
     $('lvl').style.width=Math.max(0,Math.min(100,(db+60)/50*100)).toFixed(0)+'%';
     var out=trkFeed(f>0&&f<1400?f:0,lastRms,ts,inRange);
@@ -460,33 +463,104 @@ button:focus-visible{outline:2px solid var(--ok);outline-offset:2px}
     else if(lastRms>TRK.nf*1.6&&lastRms<gate)idleMsg('Too quiet. Pluck a bit harder or move closer.');
     else idleMsg('Listening. Pluck one string and let it ring.');
   }
+  /* ---------- microphone lifecycle ---------- */
+  /* Goal: start by itself, never ask twice, and quietly recover when iOS stops the mic. */
+  var acquiring=false,healing=false,wantMic=true,micGranted=false,permState='unknown',deadFrames=0,fails=0,mutedSince=0,micPaused=false;
+  function releaseStream(){
+    try{src&&src.disconnect()}catch(e){}
+    if(stream)stream.getTracks().forEach(function(t){t.onended=null;t.onmute=null;t.onunmute=null;try{t.stop()}catch(e){}});
+    stream=null;src=null;an=null;
+  }
+  function kickAudio(){
+    var tries=0;
+    (function go(){
+      if(!ctx||ctx.state==='running'||tries++>20)return;
+      try{ctx.resume()}catch(e){}
+      setTimeout(go,300);
+    })();
+  }
   function micStart(){
+    if(acquiring)return;
     var c=ensureCtx();
     if(!c||!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
-      setMicUI(false);showIdle(MIC_MSG);return;
+      S.mic=false;setMicUI(false);showIdle(MIC_MSG);return;
     }
+    acquiring=true;wantMic=true;
     navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}}).then(function(st){
-      if(S.mic){st.getTracks().forEach(function(t){t.stop()});return}
+      acquiring=false;
+      if(!wantMic){st.getTracks().forEach(function(t){t.stop()});return}
+      releaseStream();
       stream=st;
       src=c.createMediaStreamSource(st);
       an=c.createAnalyser();an.fftSize=4096;
       src.connect(an);
       buf=new Float32Array(an.fftSize);
+      st.getTracks().forEach(function(t){
+        t.onended=function(){heal('ended')};
+        t.onmute=function(){heal('muted')};
+        t.onunmute=function(){micPaused=false;mutedSince=0;deadFrames=0;lastMsg='';kickAudio();showIdle()};
+      });
+      micGranted=true;micPaused=false;mutedSince=0;deadFrames=0;
       S.mic=true;hist.length=0;lastSig=0;waitTap=false;trkReset();lastMsg='';
       setMicUI(true);
       showIdle();
-      raf=requestAnimationFrame(tick);
-    }).catch(function(){
-      setMicUI(false);showIdle(MIC_MSG);
+      kickAudio();
+      cancelAnimationFrame(raf);raf=requestAnimationFrame(tick);
+      setTimeout(function(){if(S.mic)fails=0},5000);
+    }).catch(function(err){
+      acquiring=false;S.mic=false;setMicUI(false);
+      showIdle(err&&err.name==='NotAllowedError'?MIC_MSG:'Could not start the mic. Tap Enable mic to try again.');
     });
   }
   function micStop(){
-    S.mic=false;cancelAnimationFrame(raf);
-    try{src&&src.disconnect()}catch(e){}
-    if(stream)stream.getTracks().forEach(function(t){t.stop()});
-    stream=null;src=null;an=null;trkReset();lastMsg='';
+    wantMic=false;S.mic=false;cancelAnimationFrame(raf);
+    releaseStream();trkReset();lastMsg='';micPaused=false;
     setMicUI(false);$('lvl').style.width='0';
     showIdle();
+  }
+  function reconnect(){
+    if(!wantMic)return;
+    S.mic=false;cancelAnimationFrame(raf);releaseStream();trkReset();lastMsg='';micPaused=false;
+    if(++fails>4){setMicUI(false);showIdle('Mic stopped. Tap Enable mic to restart.');return}
+    setMicUI(false,'Reconnecting...');showIdle('Mic stopped. Reconnecting...');
+    setTimeout(function(){if(wantMic&&!S.mic&&!acquiring)micStart()},fails*400);
+  }
+  function heal(reason){
+    if(!wantMic||healing)return;
+    healing=true;
+    setTimeout(function(){
+      healing=false;
+      if(!wantMic||!S.mic)return;
+      var tr=stream&&stream.getAudioTracks&&stream.getAudioTracks()[0];
+      if(!tr||tr.readyState!=='live'||!an){reconnect();return}
+      if(tr.muted){
+        micPaused=true;
+        if(!mutedSince)mutedSince=Date.now();
+        if(Date.now()-mutedSince>6000){mutedSince=0;reconnect()}
+        else setTimeout(function(){heal('muted')},2000);
+        return;
+      }
+      mutedSince=0;micPaused=false;
+      if(ctx&&ctx.state!=='running'){kickAudio();return}
+      if(deadFrames>=80){deadFrames=0;reconnect()}
+    },reason==='ended'?100:400);
+  }
+  /* coming back to the app: wake the audio, and rebuild the mic if iOS took it away (no new prompt once allowed) */
+  function wake(){
+    if(!wantMic)return;
+    kickAudio();
+    if(!S.mic){if(!acquiring&&(micGranted||permState==='granted'))micStart();return}
+    heal('wake');
+  }
+  function startAuto(){
+    function go(){micStart()}
+    try{
+      navigator.permissions.query({name:'microphone'}).then(function(p){
+        permState=p.state;
+        p.onchange=function(){permState=p.state;if(p.state==='granted'&&wantMic&&!S.mic&&!acquiring)micStart()};
+        if(p.state==='denied'){S.mic=false;setMicUI(false);showIdle(MIC_MSG)}else go();
+      },go);
+    }catch(e){go()}
   }
 
   /* ---------- events ---------- */
@@ -509,7 +583,7 @@ button:focus-visible{outline:2px solid var(--ok);outline-offset:2px}
       hist.length=0;trkReset();lastMsg='';showIdle();
     });
   });
-  $('mic').addEventListener('click',function(){S.mic?micStop():micStart()});
+  $('mic').addEventListener('click',function(){if(S.mic){micStop()}else{wantMic=true;fails=0;micStart()}});
   function bumpA4(d){
     S.a4=Math.max(410,Math.min(470,S.a4+d));save();renderA4();renderStrings();
     if(voice){var i=voice.i;stopVoice();play(i)}else showIdle();
@@ -521,16 +595,14 @@ button:focus-visible{outline:2px solid var(--ok);outline-offset:2px}
   ['pointerdown','touchend','keydown'].forEach(function(ev){
     document.addEventListener(ev,function(){if(ctx&&ctx.state!=='running'&&ctx.resume)ctx.resume()},{passive:true});
   });
-  document.addEventListener('visibilitychange',function(){
-    if(document.hidden||!S.mic)return;
-    var tr=stream&&stream.getTracks&&stream.getTracks()[0];
-    if(!tr||tr.readyState==='ended'){micStop();micStart()}
-    else if(ctx&&ctx.state!=='running'&&ctx.resume)ctx.resume();
-  });
+  document.addEventListener('visibilitychange',function(){if(!document.hidden)wake()});
+  window.addEventListener('pageshow',wake);
+  window.addEventListener('focus',wake);
+  if(navigator.mediaDevices&&navigator.mediaDevices.addEventListener)navigator.mediaDevices.addEventListener('devicechange',function(){if(S.mic)heal('device')});
 
   /* ---------- start ---------- */
   renderA4();renderTunings();renderStrings();showIdle();
-  micStart();
+  startAuto();
 })();
 </script>
 </html>
